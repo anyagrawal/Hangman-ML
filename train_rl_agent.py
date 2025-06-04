@@ -1,67 +1,80 @@
 # train_rl_agent.py
 import random
-import string
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
-from simulator import play_game, load_dictionary
+from guess_agent import GuessAgent
 from trained_model import HangmanPolicy
 
-model = HangmanPolicy()
-optimizer = optim.Adam(model.parameters(), lr=0.001)
-loss_fn = nn.CrossEntropyLoss()
+class RLSelfPlayTrainer:
+    def __init__(self, wordbank_path="wordbank.txt", model_path="hangman_model.pt", episodes=10000):
+        self.words = self.load_words(wordbank_path)
+        self.model_path = model_path
+        self.episodes = episodes
+        self.model = HangmanPolicy()
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        self.criterion = nn.CrossEntropyLoss()
 
-all_words = load_dictionary("words_250000_train.txt")
+    def load_words(self, path):
+        with open(path, 'r') as f:
+            return [line.strip().lower() for line in f if line.strip().isalpha() and len(line.strip()) <= 20]
 
-def simulate_episode(word, max_turns=10):
-    guessed = set()
-    state = "_" * len(word)
-    history = []
-    tries = max_turns
+    def encode(self, pattern, guessed):
+        word_vec = [(ord(c) - 97 + 1) if c != '-' else 0 for c in pattern]
+        word_vec += [0] * (20 - len(word_vec))
+        guessed_vec = [1 if chr(i + 97) in guessed else 0 for i in range(26)]
+        return torch.tensor(word_vec + guessed_vec, dtype=torch.float32)
 
-    while tries > 0 and "_" in state:
-        mask = [1 if c in guessed else 0 for c in string.ascii_lowercase]
-        x = model.preprocess(state, mask)
-        x_tensor = torch.tensor(x, dtype=torch.float32).unsqueeze(0)
-        logits = model(x_tensor)
-        probs = torch.softmax(logits, dim=-1).squeeze()
-
+    def select_action(self, output, guessed):
+        probs = output.detach().clone()
         for i in range(26):
-            if string.ascii_lowercase[i] in guessed:
-                probs[i] = -1e9  # Mask guessed
+            if chr(i + 97) in guessed:
+                probs[i] = -1e9
+        return torch.argmax(probs).item()
 
-        choice_index = torch.argmax(probs).item()
-        guess_char = string.ascii_lowercase[choice_index]
+    def simulate_episode(self, secret):
+        guessed = set()
+        correct = ["-" for _ in secret]
+        states, targets = [], []
 
-        guessed.add(guess_char)
-        new_state = "".join([c if c == guess_char or c in guessed else "_" for c in word])
-        reward = sum([1 for a, b in zip(state, new_state) if a != b])  # +1 per revealed letter
-        done = new_state == word
+        for _ in range(6):
+            pattern = "".join(correct)
+            x = self.encode(pattern, guessed)
+            output = self.model(x)
+            guess_idx = self.select_action(output, guessed)
+            guess = chr(guess_idx + 97)
+            guessed.add(guess)
+            states.append(x)
+            targets.append(torch.tensor([guess_idx]))
 
-        history.append((x, choice_index, reward))
-        state = new_state
-        if guess_char not in word:
-            tries -= 1
+            if guess in secret:
+                for i, c in enumerate(secret):
+                    if c == guess:
+                        correct[i] = guess
+                if "-" not in correct:
+                    return states, targets, True
+        return states, targets, False
 
-        if done:
-            break
+    def train(self):
+        for _ in tqdm(range(self.episodes)):
+            word = random.choice(self.words)
+            states, targets, win = self.simulate_episode(word)
+            reward = 1.0 if win else -0.1
 
-    return history
+            for x, target in zip(states, targets):
+                pred = self.model(x)
+                loss = self.criterion(pred.unsqueeze(0), target)
+                self.optimizer.zero_grad()
+                loss.backward()
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        p.grad *= reward
+                self.optimizer.step()
 
-# Train loop
-for epoch in tqdm(range(10000)):
-    word = random.choice(all_words)
-    episode = simulate_episode(word)
+        torch.save(self.model.state_dict(), self.model_path)
+        print(f"RL training complete. Model saved to {self.model_path}.")
 
-    for x, action, reward in episode:
-        x_tensor = torch.tensor(x, dtype=torch.float32).unsqueeze(0)
-        target = torch.tensor([action])
-        logits = model(x_tensor)
-        loss = loss_fn(logits, target)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-torch.save(model.state_dict(), "policy.pt")
-
+if __name__ == '__main__':
+    trainer = RLSelfPlayTrainer()
+    trainer.train()
